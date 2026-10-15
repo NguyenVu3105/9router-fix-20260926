@@ -1,0 +1,379 @@
+const http = require("http");
+const path = require("path");
+const fs = require("fs");
+const crypto = require("crypto");
+const { Readable } = require("stream");
+const { pathToFileURL } = require("url");
+
+// --- /v1/messages fix: non-stream OpenAI→Anthropic conversion + classifier budget ---
+const MSG_LOG = "/tmp/9r-messages.log";
+const CLASSIFIER_MARKER = "You are a security monitor for autonomous AI coding agents";
+
+function msgLog(line) {
+  try {
+    fs.appendFileSync(MSG_LOG, new Date().toISOString() + " " + line + "\n");
+  } catch {}
+}
+
+function systemText(sys) {
+  if (typeof sys === "string") return sys;
+  if (Array.isArray(sys))
+    return sys
+      .map((b) => (typeof b === "string" ? b : b && typeof b.text === "string" ? b.text : ""))
+      .join("\n");
+  return "";
+}
+
+function openaiToAnthropic(o) {
+  const ch = (Array.isArray(o.choices) && o.choices[0]) || null;
+  const msg = (ch && ch.message) || {};
+  const content = [];
+  if (typeof msg.content === "string" && msg.content.length > 0) {
+    content.push({ type: "text", text: msg.content });
+  }
+  for (const tc of msg.tool_calls || []) {
+    const fn = tc.function || {};
+    let input = {};
+    try {
+      input = typeof fn.arguments === "string" ? JSON.parse(fn.arguments) : fn.arguments || {};
+    } catch {}
+    if (!input || typeof input !== "object") input = {};
+    content.push({
+      type: "tool_use",
+      id: tc.id || `toolu_${content.length}`,
+      name: fn.name || tc.name || "",
+      input,
+    });
+  }
+  if (content.length === 0) content.push({ type: "text", text: "" });
+  const fr = ch && ch.finish_reason;
+  const stopReason =
+    fr === "length" ? "max_tokens" : fr === "tool_calls" ? "tool_use" : "end_turn";
+  const u = o.usage || {};
+  return {
+    id: String(o.id || `msg_${Date.now()}`).replace(/^chatcmpl-/, "msg_"),
+    type: "message",
+    role: "assistant",
+    model: o.model || "unknown",
+    content,
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage: {
+      input_tokens: u.prompt_tokens || u.input_tokens || 0,
+      output_tokens: u.completion_tokens || u.output_tokens || 0,
+    },
+  };
+}
+
+function replayRequest(req, bodyBuf) {
+  const r = new Readable({ read() {} });
+  r.push(bodyBuf);
+  r.push(null);
+  Object.setPrototypeOf(r, Object.getPrototypeOf(req));
+  for (const k of [
+    "method",
+    "url",
+    "headers",
+    "httpVersion",
+    "httpVersionMajor",
+    "httpVersionMinor",
+    "socket",
+    "connection",
+  ]) {
+    if (req[k] !== undefined) r[k] = req[k];
+  }
+  r.complete = true;
+  return r;
+}
+
+function toBuf(chunk, enc) {
+  if (Buffer.isBuffer(chunk)) return chunk;
+  if (chunk instanceof Uint8Array) return Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+  if (chunk instanceof ArrayBuffer) return Buffer.from(chunk);
+  if (typeof chunk === "string") return Buffer.from(chunk, typeof enc === "string" ? enc : undefined);
+  return Buffer.from(String(chunk));
+}
+
+function attachResponseConverter(res, logTag) {
+  const origWrite = res.write.bind(res);
+  const origEnd = res.end.bind(res);
+  const origWriteHead = res.writeHead.bind(res);
+  const origFlush = res.flushHeaders ? res.flushHeaders.bind(res) : null;
+  let held = [];
+  let heldHead = null;
+  let done = false;
+
+  res.flushHeaders = function () {
+    return res;
+  };
+  res.writeHead = function (status, reason, headers) {
+    if (typeof reason !== "string") {
+      headers = reason;
+      reason = undefined;
+    }
+    heldHead = { status, reason, headers };
+    if (typeof status === "number") res.statusCode = status;
+    return res;
+  };
+  res.write = function (chunk, enc, cb) {
+    if (chunk !== undefined && chunk !== null) {
+      held.push(toBuf(chunk, enc));
+    }
+    const cbFn = typeof enc === "function" ? enc : cb;
+    if (typeof cbFn === "function") cbFn();
+    return true;
+  };
+  res.end = function (chunk, enc, cb) {
+    if (done) return res;
+    done = true;
+    const cbFn = typeof enc === "function" ? enc : cb;
+    if (chunk !== undefined && chunk !== null && typeof chunk !== "function") {
+      held.push(toBuf(chunk, enc));
+    }
+    let out = Buffer.concat(held);
+    const ct = String(res.getHeader("content-type") || "");
+    let transformed = false;
+    try {
+      if (/application\/json/i.test(ct) && out.length > 0) {
+        const o = JSON.parse(out.toString("utf8"));
+        if (o && o.object === "chat.completion" && !o.object?.includes?.("chunk")) {
+          out = Buffer.from(JSON.stringify(openaiToAnthropic(o)));
+          transformed = true;
+          msgLog(`${logTag} resp openai→anthropic bytes=${out.length}`);
+        }
+      }
+    } catch {}
+    if (!transformed) msgLog(`${logTag} resp passthrough ct=${ct.slice(0, 60)} bytes=${out.length}`);
+
+    res.write = origWrite;
+    res.end = origEnd;
+    res.writeHead = origWriteHead;
+    if (origFlush) res.flushHeaders = origFlush;
+
+    try {
+      if (res.destroyed) {
+        msgLog(`${logTag} resp dropped: socket destroyed`);
+        return res;
+      }
+      res.setHeader("content-length", String(out.length));
+      if (heldHead) {
+        let h = heldHead.headers;
+        if (h && typeof h === "object" && !Array.isArray(h)) {
+          h = { ...h };
+          delete h["content-length"];
+          delete h["Content-Length"];
+        }
+        origWriteHead(heldHead.status, heldHead.reason, typeof h === "object" ? h : undefined);
+      }
+      if (out.length > 0) origWrite(out);
+      origEnd(typeof cbFn === "function" ? cbFn : undefined);
+    } catch (e) {
+      msgLog(`${logTag} flush-error=${e && e.message}`);
+      try {
+        res.destroy && res.destroy();
+      } catch {}
+    }
+    return res;
+  };
+  res.on("error", (e) => {
+    msgLog(`${logTag} res-error=${e && e.message}`);
+  });
+}
+
+function routeMessagesFix(req, res, handler) {
+  if (req.method !== "POST" || !/\/v1\/messages(\/count_tokens)?(\?|$)/.test(req.url || "")) {
+    return handler(req, res);
+  }
+    const parts = [];
+    const isCountTokens = /\/count_tokens(\?|$)/.test(req.url || "");
+    let bodyEnded = false;
+    req.on("data", (c) => parts.push(c));
+    req.on("error", () => {});
+    req.on("close", () => {
+      if (!bodyEnded) {
+        msgLog(`req ${req.url} aborted-before-end`);
+        try {
+          res.destroy && res.destroy();
+        } catch {}
+      }
+    });
+    req.on("end", () => {
+      bodyEnded = true;
+      const raw = Buffer.concat(parts);
+      let body = null;
+      try {
+        body = JSON.parse(raw.toString("utf8"));
+      } catch {}
+      let out = raw;
+      let logTag = `req ${req.url}`;
+      if (body && typeof body === "object") {
+        const sysText = systemText(body.system);
+        const isClassifier = sysText.includes(CLASSIFIER_MARKER);
+        const mt = typeof body.max_tokens === "number" ? body.max_tokens : 0;
+        logTag += ` model=${body.model} stream=${!!body.stream} max_tokens=${mt}` +
+          ` classifier=${isClassifier} ua=${(req.headers["user-agent"] || "").slice(0, 40)}`;
+        if (!isCountTokens && (isClassifier || (!body.stream && mt > 0 && mt <= 512)) && mt < 4096) {
+          body.max_tokens = 4096;
+          out = Buffer.from(JSON.stringify(body));
+          logTag += ` → max_tokens=4096`;
+        }
+        if (!isCountTokens && !body.stream) attachResponseConverter(res, logTag);
+      } else {
+        logTag += " unparseable-body";
+      }
+      msgLog(logTag);
+      try {
+        handler(replayRequest(req, out), res);
+      } catch (e) {
+        msgLog(`${logTag} handler-error=${e && e.message}`);
+        try {
+          if (!res.headersSent) {
+            res.statusCode = 500;
+            res.setHeader("content-type", "application/json");
+          }
+          res.end(JSON.stringify({ error: { message: String((e && e.message) || e), type: "api_error" } }));
+        } catch {
+          try {
+            res.destroy && res.destroy();
+          } catch {}
+        }
+      }
+    });
+}
+
+const origCreate = http.createServer.bind(http);
+
+// Per-process secret proving x-9r-real-ip was stamped below rather than sent by the client.
+// A bare `next start` / `next dev` never loads this file, so it cannot produce a matching
+// header even though the env var is inherited by child processes. Named like x-9r-cli-token
+// so the request-detail header sanitizer redacts it too.
+const PEER_TOKEN = crypto.randomBytes(24).toString("hex");
+process.env.NINEROUTER_PEER_TOKEN = PEER_TOKEN;
+
+let backgroundRefreshStarted = false;
+
+function startBackgroundTokenRefreshFromCustomServer() {
+  if (backgroundRefreshStarted) return;
+  backgroundRefreshStarted = true;
+  // Prefer source path (repo / standalone that still has src). Fail-open if missing
+  // — initializeApp also starts the same scheduler when the Next app boots.
+  const modPath = path.join(__dirname, "src", "sse", "services", "backgroundTokenRefresh.js");
+  import(pathToFileURL(modPath).href)
+    .then((m) => {
+      try {
+        m.startBackgroundTokenRefresh();
+      } catch (e) {
+        console.error("[BackgroundTokenRefresh] start failed:", e && e.message ? e.message : e);
+      }
+      const stop = () => {
+        try {
+          m.stopBackgroundTokenRefresh();
+        } catch {
+          /* ignore */
+        }
+      };
+      process.once("SIGINT", stop);
+      process.once("SIGTERM", stop);
+    })
+    .catch((e) => {
+      // Expected in published CLI standalone (src/ not on disk). App bootstrap covers it.
+      if (process.env.DEBUG_BACKGROUND_TOKEN_REFRESH) {
+        console.error("[BackgroundTokenRefresh] import failed:", e && e.message ? e.message : e);
+      }
+    });
+}
+
+// Wrap Next standalone HTTP server: derive client IP from the TCP socket
+// (unspoofable) and strip client-supplied forwarding headers so downstream
+// rate-limiting keys on the real peer address instead of attacker-controlled XFF.
+http.createServer = (...args) => {
+  const handler = args.find((a) => typeof a === "function");
+  const rest = args.filter((a) => typeof a !== "function");
+  if (!handler) return origCreate(...args);
+  const wrapped = (req, res) => {
+    const socketIp = req.socket && req.socket.remoteAddress ? req.socket.remoteAddress : "";
+    const xff = req.headers["x-forwarded-for"];
+    const xRealIp = req.headers["x-real-ip"];
+    const viaProxy = !!(xff || xRealIp);
+    const isLoopbackProxy = socketIp === "127.0.0.1" || socketIp === "::1" || socketIp === "::ffff:127.0.0.1";
+    // Trust forwarding headers only when the TCP peer is a local reverse proxy.
+    // Direct/public sockets remain keyed by the unspoofable peer address.
+    const proxyIp = xRealIp || (xff ? String(xff).split(",")[0].trim() : "");
+    const ip = isLoopbackProxy && proxyIp ? proxyIp : socketIp;
+    delete req.headers["x-9r-real-ip"];
+    delete req.headers["x-forwarded-for"];
+    delete req.headers["x-9r-via-proxy"];
+    delete req.headers["x-9r-peer-token"];
+    req.headers["x-9r-real-ip"] = ip;
+    req.headers["x-9r-peer-token"] = PEER_TOKEN;
+    if (viaProxy) req.headers["x-9r-via-proxy"] = "1";
+    if (/messages/.test(req.url || "")) {
+      msgLog(`raw ${req.method} ${req.url} ua=${(req.headers["user-agent"] || "").slice(0, 50)}`);
+    }
+    return routeMessagesFix(req, res, handler);
+  };
+  const server = origCreate(...rest, wrapped);
+  server.once("listening", () => {
+    startBackgroundTokenRefreshFromCustomServer();
+  });
+  const origEmit = server.emit;
+  // JBR 25 sends h2c upgrades that the HTTP/1.1 server would otherwise close.
+  server.emit = function (event, ...eventArgs) {
+    const [req, socket, head] = eventArgs;
+    if (event !== "upgrade" || String(req.headers.upgrade || "").toLowerCase() !== "h2c") {
+      return origEmit.call(this, event, ...eventArgs);
+    }
+
+    const contentLength = Number(req.headers["content-length"] || 0);
+    if (!Number.isSafeInteger(contentLength) || contentLength < 0) {
+      socket.destroy();
+      return true;
+    }
+    const chunks = [head];
+    let received = head.length;
+    const serve = () => {
+      // Replay the upgraded request through the existing HTTP/1.1 handler.
+      const replay = new http.IncomingMessage(socket);
+      Object.assign(replay, { method: req.method, url: req.url, headers: req.headers, complete: true });
+      if (received) replay.push(Buffer.concat(chunks, received).subarray(0, contentLength));
+      replay.push(null);
+      const res = new http.ServerResponse(replay);
+      res.shouldKeepAlive = false;
+      res.assignSocket(socket);
+      res.once("finish", () => socket.end());
+      Promise.resolve().then(() => wrapped(replay, res)).catch((error) => {
+        console.error("Failed to downgrade h2c request", error);
+        socket.destroy();
+      });
+    };
+    if (received >= contentLength) serve();
+    else {
+      socket.on("data", function readBody(chunk) {
+        chunks.push(chunk);
+        received += chunk.length;
+        if (received < contentLength) return;
+        socket.off("data", readBody);
+        serve();
+      });
+      socket.resume();
+    }
+    delete req.headers.upgrade;
+    delete req.headers["http2-settings"];
+    req.headers.connection = "close";
+    return true;
+  };
+  return server;
+};
+
+if (require.main === module) {
+  const standalone = path.join(__dirname, "server.js");
+  if (fs.existsSync(standalone)) {
+    require(standalone);
+  } else {
+    // Repo checkout has no standalone build next to us. `next start` builds its HTTP
+    // server in-process, so the wrapper above still sanitizes every request.
+    const nextBin = require.resolve("next/dist/bin/next");
+    process.argv = [process.argv[0], nextBin, "start", ...process.argv.slice(2)];
+    require(nextBin);
+  }
+}

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.9router.autostart</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/Cellar/node/26.7.0/bin/node</string>
+        <string>/opt/homebrew/lib/node_modules/9router/cli.js</string>
+        <string>--tray</string>
+        <string>--skip-update</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/Cellar/node/26.7.0/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/9router.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/9router.error.log</string>
+</dict>
+</plist>
